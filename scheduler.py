@@ -16,11 +16,11 @@ from config import CHECK_INTERVAL
 logger = logging.getLogger(__name__)
 
 class NewsScheduler:
-    def __init__(self):
-        self.db = Database()
-        self.scraper = NewsScraper()
-        self.mistral = MistralClient()
-        self.openai = OpenAIClient()
+    def __init__(self, db: Database, scraper: NewsScraper, mistral: MistralClient, openai: OpenAIClient):
+        self.db = db
+        self.scraper = scraper
+        self.mistral = mistral
+        self.openai = openai
         self.is_running = False
         self.thread = None
     

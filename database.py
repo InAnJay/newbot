@@ -4,10 +4,12 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import logging
 
+from config import DB_PATH, INITIAL_KEYWORDS
+
 logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path: str = "news_bot.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self.init_database()
     
@@ -45,7 +47,7 @@ class Database:
                     status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected', 'published'
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     published_at TIMESTAMP,
-                    FOREIGN KEY (source_id) REFERENCES news_sources (id)
+                    FOREIGN KEY (source_id) REFERENCES news_sources (id) ON DELETE CASCADE
                 )
             ''')
             
@@ -84,8 +86,29 @@ class Database:
                 )
             ''')
             
+            # Таблица ключевых слов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             conn.commit()
+            
+            # Заполняем ключевые слова, если таблица пуста
+            self.seed_initial_keywords()
     
+    def seed_initial_keywords(self):
+        """Заполняет таблицу ключевых слов начальными данными из конфига."""
+        current_keywords = self.get_keywords()
+        if not current_keywords and INITIAL_KEYWORDS:
+            logger.info("База данных ключевых слов пуста. Заполняю начальными значениями...")
+            for keyword in INITIAL_KEYWORDS:
+                self.add_keyword(keyword)
+            logger.info(f"Добавлено {len(INITIAL_KEYWORDS)} ключевых слов в базу.")
+
     def add_news_source(self, name: str, url: str, source_type: str) -> int:
         """Добавить новый источник новостей"""
         with sqlite3.connect(self.db_path) as conn:
@@ -123,9 +146,7 @@ class Database:
         """Удалить источник новостей и связанные с ним статьи."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Сначала удаляем связанные статьи, чтобы избежать ошибок внешнего ключа
-            cursor.execute("DELETE FROM news_articles WHERE source_id = ?", (source_id,))
-            # Затем удаляем сам источник
+            # Статьи удалятся автоматически благодаря ON DELETE CASCADE
             cursor.execute("DELETE FROM news_sources WHERE id = ?", (source_id,))
             conn.commit()
     
@@ -245,3 +266,30 @@ class Database:
                 INSERT OR REPLACE INTO bot_settings (key, value, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
             ''', (key, value))
+    
+    # --- Методы для управления ключевыми словами ---
+    
+    def get_keywords(self) -> List[str]:
+        """Получить все ключевые слова из базы данных."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT keyword FROM keywords ORDER BY keyword")
+            return [row[0] for row in cursor.fetchall()]
+
+    def add_keyword(self, keyword: str) -> bool:
+        """Добавить новое ключевое слово. Возвращает True, если успешно."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO keywords (keyword) VALUES (?)", (keyword.lower(),))
+                return True
+        except sqlite3.IntegrityError:
+            logger.warning(f"Ключевое слово '{keyword}' уже существует в базе.")
+            return False
+    
+    def delete_keyword(self, keyword: str) -> bool:
+        """Удалить ключевое слово. Возвращает True, если успешно."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM keywords WHERE keyword = ?", (keyword.lower(),))
+            return cursor.rowcount > 0

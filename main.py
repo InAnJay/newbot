@@ -14,6 +14,9 @@ from telegram_bot import NewsBot
 from scheduler import NewsScheduler
 from database import Database
 from config import TELEGRAM_BOT_TOKEN, MISTRAL_API_KEY, OPENAI_API_KEY, ADMIN_USER_ID, TARGET_CHANNEL_ID
+from mistral_client import MistralClient
+from openai_client import OpenAIClient
+from news_scraper import NewsScraper
 
 # --- Настройка логирования ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -54,21 +57,23 @@ def check_env_vars():
 
 def main():
     """Основная функция для запуска бота."""
+    scraper = None  # Инициализируем scraper как None
     try:
-        # Загрузка переменных окружения
-        load_dotenv()
-        logger.info("Переменные окружения загружены.")
+        # Переменные окружения уже загружаются в config.py
+        logger.info("Инициализация приложения...")
 
         # Проверка ключевых переменных
         check_env_vars()
         logger.info("Проверка переменных окружения пройдена.")
 
         # Инициализация компонентов
-        # Этот вызов `Database()` единственный и правильный.
-        # Он создаст и настроит базу данных при первом запуске.
-        db = Database() 
-        bot = NewsBot()
-        scheduler = NewsScheduler()
+        db = Database()
+        mistral = MistralClient()
+        openai = OpenAIClient()
+        scraper = NewsScraper(mistral, db) # Передаем mistral и db в scraper
+        
+        scheduler = NewsScheduler(db, scraper, mistral, openai)
+        bot = NewsBot(db, scheduler, mistral, openai)
 
         # Запуск планировщика в отдельном потоке
         scheduler.start_scheduler()
@@ -85,6 +90,11 @@ def main():
         # Любая другая ошибка при инициализации
         logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        # Корректно закрываем Selenium WebDriver при выходе
+        if scraper:
+            scraper.close()
+        logger.info("Приложение завершило работу.")
 
 if __name__ == "__main__":
     main()
