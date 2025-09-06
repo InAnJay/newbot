@@ -83,9 +83,11 @@ class NewsScheduler:
                     logger.error(f"Ошибка при проверке источника {source['name']}: {e}")
             
             logger.info(f"Проверка завершена. Найдено новых статей: {new_articles_count}")
+            return new_articles_count
             
         except Exception as e:
             logger.error(f"Ошибка при проверке источников: {e}")
+            return 0
     
     def process_pending_articles(self):
         """Обработать статьи в статусе 'pending'"""
@@ -214,10 +216,11 @@ class NewsScheduler:
             'jobs_count': len(schedule.jobs)
         }
     
-    def force_check_sources(self):
-        """Принудительная проверка источников"""
+    def force_check_sources(self) -> int:
+        """Принудительная проверка источников и возврат количества новых статей."""
         logger.info("Запускаю принудительную проверку источников...")
-        self.check_sources_for_news()
+        count = self.check_sources_for_news()
+        return count
     
     def force_process_articles(self):
         """Принудительная обработка статей"""

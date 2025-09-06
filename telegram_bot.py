@@ -68,6 +68,8 @@ class NewsBot:
         
         if data == "view_news":
             await self.show_pending_news(query, context)
+        elif data == "delete_duplicates":
+            await self.delete_duplicates(query, context)
         elif data == "manage_sources":
             await self.manage_sources(query)
         elif data == "check_sources":
@@ -120,7 +122,25 @@ class NewsBot:
             else:
                 # Пробрасываем другие, неизвестные ошибки
                 raise
-    
+
+    async def delete_duplicates(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Удаляет дубликаты статей и обновляет список."""
+        await query.answer("⏳ Ищу и удаляю дубликаты...")
+        
+        deleted_count = self.db.delete_duplicate_articles()
+        
+        # Используем edit_message_text, чтобы не отправлять новое всплывающее уведомление, 
+        # а сразу показать результат в основном сообщении.
+        
+        # Сначала покажем короткое уведомление
+        if deleted_count > 0:
+            await context.bot.send_message(query.message.chat_id, f"✅ Удалено {deleted_count} дубликатов.")
+        else:
+            await context.bot.send_message(query.message.chat_id, "👍 Дубликаты не найдены.")
+            
+        # Обновляем текущее сообщение со списком новостей
+        await self.show_pending_news(query, context)
+
     async def show_pending_news(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Показывает список новостей на модерации (надежная версия)."""
         articles = self.db.get_pending_articles()
@@ -135,6 +155,9 @@ class NewsBot:
                 keyboard.append(
                     [InlineKeyboardButton(title, callback_data=f"article_{article['id']}")]
                 )
+        
+        if articles:
+            keyboard.append([InlineKeyboardButton("🗑️ Удалить дубли", callback_data="delete_duplicates")])
 
         keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data="main_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -488,16 +511,37 @@ class NewsBot:
             return url
 
     async def check_sources(self, query, context: ContextTypes.DEFAULT_TYPE):
-        """Запускает принудительную проверку источников через планировщик."""
-        await query.answer("⏳ Запускаю проверку источников...")
+        """Запускает принудительную проверку источников и сообщает результат."""
+        await query.answer("⏳ Запускаю проверку источников... Это может занять некоторое время.")
         
-        # Запускаем проверку в фоновом режиме, чтобы не блокировать бота
+        # Редактируем сообщение, чтобы показать, что идет работа
+        try:
+            await query.edit_message_text(
+                text="⏳ Выполняется проверка источников... Пожалуйста, подождите.",
+            )
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass # Ничего страшного, если сообщение уже такое
+            else:
+                raise
+
+        # Запускаем тяжелую задачу в отдельном потоке
         loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, self.scheduler.force_check_sources)
+        new_articles_count = await loop.run_in_executor(
+            None, self.scheduler.force_check_sources
+        )
+
+        # Сообщаем результат и снова показываем меню
+        text = (
+            f"✅ Проверка завершена!\n\n"
+            f"Найдено новых статей: **{new_articles_count}**.\n\n"
+            "Новые статьи (если они есть) теперь доступны для модерации в разделе 'Просмотреть новости'."
+        )
         
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="✅ Команда на проверку источников отправлена. Результаты появятся в логах."
+        await query.edit_message_text(
+            text=text,
+            reply_markup=self.get_main_menu_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
         )
     
     async def show_statistics(self, query):

@@ -293,3 +293,36 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM keywords WHERE keyword = ?", (keyword.lower(),))
             return cursor.rowcount > 0
+
+    def delete_duplicate_articles(self) -> int:
+        """
+        Удаляет дубликаты статей на основе original_url, оставляя только самую старую запись.
+        Возвращает количество удаленных статей.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Сначала получаем id статей, которые нужно удалить
+            cursor.execute('''
+                SELECT id FROM news_articles
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM news_articles
+                    GROUP BY original_url
+                )
+            ''')
+            
+            ids_to_delete = [row[0] for row in cursor.fetchall()]
+            
+            if not ids_to_delete:
+                return 0
+            
+            # Удаляем найденные дубликаты
+            placeholders = ','.join('?' for _ in ids_to_delete)
+            cursor.execute(f"DELETE FROM news_articles WHERE id IN ({placeholders})", ids_to_delete)
+            
+            deleted_count = cursor.rowcount
+            conn.commit()
+            
+            logger.info(f"Удалено {deleted_count} дубликатов статей.")
+            return deleted_count
