@@ -14,10 +14,12 @@ class OpenAIClient:
     Клиент для работы с API OpenAI, используется ИСКЛЮЧИТЕЛЬНО для генерации изображений.
     """
     def __init__(self):
+        # API ключ теперь подхватывается автоматически из переменных окружения
+        # библиотекой openai. Оставляем проверку для надежности.
         if not OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY не установлен в переменных окружения")
 
-        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        self.client = openai.OpenAI()
         self.dalle_model = "dall-e-3"
         
         # Создаем папку для изображений, если ее нет

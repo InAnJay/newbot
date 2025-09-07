@@ -6,6 +6,7 @@
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================${NC}"
@@ -47,14 +48,14 @@ if ! python3 -c "from dotenv import load_dotenv; import os; load_dotenv(); asser
     echo
     echo -e "${RED}ПОЖАЛУЙСТА, ЗАПОЛНИТЕ .env файл!${NC}"
     echo
-    echo -e "💡 Для получения Telegram ID отправьте /start боту @userinfobot"
+    echo -e "${BLUE}💡 Для получения Telegram ID отправьте /start боту @userinfobot${NC}"
     exit 1
 fi
 
 echo -e "${GREEN}Конфигурация в порядке.${NC}"
 echo
 
-echo -e "Запускаю бота..."
+echo -e "${BLUE}Запускаю бота...${NC}"
 echo "(Для остановки нажмите Ctrl+C)"
 echo
 

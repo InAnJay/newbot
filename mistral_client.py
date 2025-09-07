@@ -7,22 +7,32 @@ from mistralai.client import MistralClient as MistralAIClient
 from mistralai.models.chat_completion import ChatMessage
 
 from config import MISTRAL_API_KEY
+from database import Database
 
 logger = logging.getLogger(__name__)
 
 
 class MistralClient:
     def __init__(self):
+        # API ключ теперь обычно подхватывается автоматически из переменных окружения
+        # библиотекой mistralai. Оставляем проверку для надежности.
         if not MISTRAL_API_KEY:
             raise ValueError("MISTRAL_API_KEY не установлен в переменных окружения")
 
         self.client = MistralAIClient(api_key=MISTRAL_API_KEY)
+        # Загружаем ключевые слова один раз при инициализации
+        self.db = Database()
+        self.keywords = self.db.get_keywords()
+        if not self.keywords:
+            logger.warning("Список ключевых слов в базе данных пуст. Рерайт может быть не совсем точным.")
+            # Можно задать базовый набор по умолчанию, если это необходимо
+            self.keywords = ['маркетплейс', 'e-commerce', 'онлайн-торговля']
 
     def rewrite_news_article(self, title: str, content: str) -> Dict[str, str]:
         """Переписать новостную статью в удобном формате с помощью Mistral."""
         try:
             prompt = f"""
-Перепиши следующую новость о маркетплейсах в удобном и привлекательном формате для публикации в Telegram канале:
+Перепиши следующую новость (тема: {", ".join(self.keywords)}) в удобном и привлекательном формате для публикации в Telegram канале:
 
 ЗАГОЛОВOК: {title}
 СОДЕРЖАНИЕ: {content}

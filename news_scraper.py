@@ -11,30 +11,56 @@ from urllib.parse import urljoin, urlparse
 import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-from config import USER_AGENT, MARKETPLACE_KEYWORDS
+from config import USER_AGENT
 from mistral_client import MistralClient
+from database import Database
+from telegram_client import TelegramScraperClient
 
 logger = logging.getLogger(__name__)
 
 class NewsScraper:
-    def __init__(self):
+    def __init__(self, mistral_client: MistralClient, db: Database, telegram_client: Optional[TelegramScraperClient]):
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': USER_AGENT})
         self._driver = None
-        self.mistral = MistralClient()
+        self.mistral = mistral_client
+        self.db = db
+        self.telegram_client = telegram_client
         
+    def close(self):
+        """Закрывает Selenium WebDriver, если он был инициализирован."""
+        if self._driver:
+            try:
+                self._driver.quit()
+                logger.info("Selenium WebDriver успешно закрыт.")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии Selenium WebDriver: {e}")
+            finally:
+                self._driver = None
+
     def _get_selenium_driver(self):
         """Инициализирует и возвращает Selenium WebDriver."""
         if self._driver is None:
             chrome_options = Options()
-            chrome_options.add_argument("--headless")  # Запуск в фоновом режиме
+            chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            # Маскировка под реального пользователя
             chrome_options.add_argument(f"user-agent={USER_AGENT}")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            # Игнорирование ошибок SSL
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--allow-insecure-localhost')
+
             try:
-                # Используем встроенный Selenium Manager, который не требует webdriver-manager
                 self._driver = webdriver.Chrome(options=chrome_options)
+                self._driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             except Exception as e:
                 logger.error(f"Не удалось инициализировать Selenium WebDriver: {e}")
                 logger.error("Убедитесь, что Google Chrome установлен в системе.")
@@ -42,21 +68,30 @@ class NewsScraper:
         return self._driver
 
     def _get_dynamic_page_source(self, url: str) -> str:
-        """Получает HTML-код страницы после выполнения JavaScript."""
+        """Получает HTML-код страницы после выполнения JavaScript, используя умное ожидание."""
         try:
             driver = self._get_selenium_driver()
             driver.get(url)
-            # Даем время на прогрузку JS
-            time.sleep(5) 
+            
+            # Умное ожидание появления одного из типичных контейнеров для новостей
+            wait = WebDriverWait(driver, 15) # Ждем до 15 секунд
+            wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "article, .news, .post, .entry, [class*='news-'], [class*='post-']"))
+            )
+            
             return driver.page_source
         except Exception as e:
-            logger.error(f"Ошибка при получении динамического HTML с {url}: {e}")
+            logger.error(f"Ошибка при получении динамического HTML с {url} (возможно, тайм-аут ожидания контента): {e}")
             return ""
 
     def is_marketplace_related(self, text: str) -> bool:
-        """Проверить, относится ли текст к маркетплейсам"""
+        """Проверить, относится ли текст к маркетплейсам, используя ключевые слова из БД."""
         text_lower = text.lower()
-        return any(keyword in text_lower for keyword in MARKETPLACE_KEYWORDS)
+        keywords = self.db.get_keywords()
+        if not keywords:
+            # Если в базе нет слов, возвращаем True, чтобы не отфильтровать всё
+            return True
+        return any(keyword in text_lower for keyword in keywords)
     
     def _parse_shoppers_media(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
         """Специализированный парсер для shoppers.media."""
@@ -116,9 +151,9 @@ class NewsScraper:
         text = soup.get_text()
         return self.clean_text(text)
     
-    def scrape_website_with_gpt(self, url: str) -> List[Dict]:
-        """Использует Selenium для получения HTML и GPT для его анализа."""
-        logger.info(f"Использую GPT для анализа сайта: {url}")
+    def scrape_website_with_mistral(self, url: str) -> List[Dict]:
+        """Использует Selenium для получения HTML и Mistral для его анализа."""
+        logger.info(f"Использую Mistral для анализа сайта: {url}")
         html_content = self._get_dynamic_page_source(url)
         if not html_content:
             return []
@@ -170,76 +205,52 @@ class NewsScraper:
             return []
     
     def scrape_website(self, url: str) -> List[Dict]:
-        """Парсинг обычного веб-сайта"""
+        """
+        Основной метод для парсинга веб-сайтов.
+        Использует специализированные парсеры для известных сайтов и Mistral AI для остальных.
+        """
         try:
-            # Для сайтов, требующих JS, используем новый метод с GPT
-            if 'shoppers.media' in url:
-                return self.scrape_website_with_gpt(url)
-
-            # Для статических сайтов используем requests
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
+            hostname = urlparse(url).hostname
             
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            articles = []
-            
-            # Ищем статьи по различным селекторам
-            article_selectors = [
-                'article',
-                '.article',
-                '.news-item',
-                '.post',
-                '.entry',
-                '[class*="article"]',
-                '[class*="news"]',
-                '[class*="post"]'
-            ]
-            
-            for selector in article_selectors:
-                elements = soup.select(selector)
-                for element in elements:
-                    # Извлекаем заголовок
-                    title_elem = element.find(['h1', 'h2', 'h3', '.title', '.headline'])
-                    title = title_elem.get_text().strip() if title_elem else ""
-                    
-                    # Извлекаем контент
-                    content_elem = element.find(['p', '.content', '.text', '.description'])
-                    content = content_elem.get_text().strip() if content_elem else ""
-                    
-                    # Извлекаем ссылку
-                    link_elem = element.find('a', href=True)
-                    link = urljoin(url, link_elem['href']) if link_elem else url
-                    
-                    # Проверяем релевантность
-                    if title and self.is_marketplace_related(title + ' ' + content):
-                        articles.append({
-                            'title': self.clean_text(title),
-                            'content': self.clean_text(content),
-                            'url': link,
-                            'published': None
-                        })
-            
-            return articles
-            
+            if hostname == 'shoppers.media':
+                # Для shoppers.media делаем запрос через requests и используем кастомный парсер
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                return self._parse_shoppers_media(soup, url)
+            else:
+                # Для всех остальных сайтов используем Selenium + Mistral
+                return self.scrape_website_with_mistral(url)
+                
+        except requests.RequestException as e:
+            logger.error(f"Ошибка сети при парсинге сайта {url}: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Ошибка при парсинге сайта {url}: {e}")
+            logger.error(f"Общая ошибка при парсинге сайта {url}: {e}")
             return []
     
     def scrape_telegram_channel(self, channel_url: str) -> List[Dict]:
-        """Парсинг Telegram канала (базовая реализация)"""
-        # Для полноценного парсинга Telegram нужен Telegram API
-        # Здесь базовая реализация для демонстрации
-        try:
-            # В реальном проекте здесь будет интеграция с Telegram API
-            # или использование веб-версии Telegram
-            logger.info(f"Парсинг Telegram канала: {channel_url}")
+        """Парсинг Telegram-канала с использованием Telethon клиента."""
+        if not self.telegram_client:
+            logger.warning(f"Парсинг Telegram-каналов отключен, так как не заданы TELEGRAM_API_ID и TELEGRAM_API_HASH. Пропуск источника: {channel_url}")
             return []
             
+        logger.info(f"Парсинг Telegram-канала: {channel_url}")
+        try:
+            # Запускаем асинхронную функцию в синхронном контексте
+            messages = asyncio.run(self.telegram_client.get_channel_messages(channel_url))
+            
+            # Фильтруем по ключевым словам
+            relevant_articles = [
+                msg for msg in messages 
+                if self.is_marketplace_related(msg['content'])
+            ]
+            return relevant_articles
+            
         except Exception as e:
-            logger.error(f"Ошибка при парсинге Telegram канала {channel_url}: {e}")
+            logger.error(f"Ошибка при парсинге Telegram-канала {channel_url}: {e}")
             return []
-    
+            
     def scrape_source(self, source_type: str, url: str) -> List[Dict]:
         """Парсинг источника в зависимости от его типа"""
         if source_type == 'rss':
@@ -337,6 +348,5 @@ class NewsScraper:
         return articles
 
     def __del__(self):
-        """Закрывает драйвер при уничтожении объекта."""
-        if self._driver:
-            self._driver.quit()
+        """Вызывает close() при уничтожении объекта для обратной совместимости."""
+        self.close()

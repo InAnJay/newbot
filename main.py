@@ -10,10 +10,18 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
-from telegram_bot import NewsBot
-from scheduler import NewsScheduler
+from config import (
+    TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, TARGET_CHANNEL_ID,
+    MISTRAL_API_KEY, OPENAI_API_KEY,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH
+)
 from database import Database
-from config import TELEGRAM_BOT_TOKEN, MISTRAL_API_KEY, OPENAI_API_KEY, ADMIN_USER_ID, TARGET_CHANNEL_ID
+from news_scraper import NewsScraper
+from mistral_client import MistralClient
+from openai_client import OpenAIClient
+from telegram_client import TelegramScraperClient
+from scheduler import NewsScheduler
+from telegram_bot import NewsBot
 
 # --- Настройка логирования ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -54,27 +62,36 @@ def check_env_vars():
 
 def main():
     """Основная функция для запуска бота."""
+    scraper = None  # Инициализируем scraper как None
     try:
-        # Загрузка переменных окружения
-        load_dotenv()
-        logger.info("Переменные окружения загружены.")
+        # Переменные окружения уже загружаются в config.py
+        logger.info("Инициализация приложения...")
 
         # Проверка ключевых переменных
         check_env_vars()
         logger.info("Проверка переменных окружения пройдена.")
 
-        # Инициализация компонентов
-        # Этот вызов `Database()` единственный и правильный.
-        # Он создаст и настроит базу данных при первом запуске.
-        db = Database() 
-        bot = NewsBot()
-        scheduler = NewsScheduler()
-
-        # Запуск планировщика в отдельном потоке
+        # --- 3. Инициализация компонентов ---
+        logger.info("Инициализация компонентов...")
+        db = Database()
+        mistral_client = MistralClient()
+        openai_client = OpenAIClient()
+        
+        telegram_scraper_client = None
+        if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+            logger.info("Найдены ключи Telegram API. Активирую парсинг Telegram-каналов.")
+            telegram_scraper_client = TelegramScraperClient()
+        else:
+            logger.warning("TELEGRAM_API_ID и TELEGRAM_API_HASH не найдены в .env. Парсинг Telegram-каналов отключен.")
+        
+        news_scraper = NewsScraper(mistral_client, db, telegram_scraper_client)
+        
+        scheduler = NewsScheduler(db, news_scraper, mistral_client, openai_client)
         scheduler.start_scheduler()
 
         # Запуск бота
         logger.info("Запускаю Telegram-бота...")
+        bot = NewsBot(db, scheduler, mistral_client, openai_client)
         bot.run()
 
     except ValueError as ve:
@@ -85,6 +102,11 @@ def main():
         # Любая другая ошибка при инициализации
         logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        # Корректно закрываем Selenium WebDriver при выходе
+        if scraper:
+            scraper.close()
+        logger.info("Приложение завершило работу.")
 
 if __name__ == "__main__":
     main()
