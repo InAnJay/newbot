@@ -11,20 +11,25 @@ from urllib.parse import urljoin, urlparse
 import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 from config import USER_AGENT
 from mistral_client import MistralClient
 from database import Database
+from telegram_client import TelegramScraperClient
 
 logger = logging.getLogger(__name__)
 
 class NewsScraper:
-    def __init__(self, mistral_client: MistralClient, db: Database):
+    def __init__(self, mistral_client: MistralClient, db: Database, telegram_client: Optional[TelegramScraperClient]):
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': USER_AGENT})
         self._driver = None
         self.mistral = mistral_client
         self.db = db
+        self.telegram_client = telegram_client
         
     def close(self):
         """Закрывает Selenium WebDriver, если он был инициализирован."""
@@ -41,13 +46,21 @@ class NewsScraper:
         """Инициализирует и возвращает Selenium WebDriver."""
         if self._driver is None:
             chrome_options = Options()
-            chrome_options.add_argument("--headless")  # Запуск в фоновом режиме
+            chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            # Маскировка под реального пользователя
             chrome_options.add_argument(f"user-agent={USER_AGENT}")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            # Игнорирование ошибок SSL
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--allow-insecure-localhost')
+
             try:
-                # Используем встроенный Selenium Manager, который не требует webdriver-manager
                 self._driver = webdriver.Chrome(options=chrome_options)
+                self._driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             except Exception as e:
                 logger.error(f"Не удалось инициализировать Selenium WebDriver: {e}")
                 logger.error("Убедитесь, что Google Chrome установлен в системе.")
@@ -55,15 +68,20 @@ class NewsScraper:
         return self._driver
 
     def _get_dynamic_page_source(self, url: str) -> str:
-        """Получает HTML-код страницы после выполнения JavaScript."""
+        """Получает HTML-код страницы после выполнения JavaScript, используя умное ожидание."""
         try:
             driver = self._get_selenium_driver()
             driver.get(url)
-            # Даем время на прогрузку JS
-            time.sleep(5) 
+            
+            # Умное ожидание появления одного из типичных контейнеров для новостей
+            wait = WebDriverWait(driver, 15) # Ждем до 15 секунд
+            wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "article, .news, .post, .entry, [class*='news-'], [class*='post-']"))
+            )
+            
             return driver.page_source
         except Exception as e:
-            logger.error(f"Ошибка при получении динамического HTML с {url}: {e}")
+            logger.error(f"Ошибка при получении динамического HTML с {url} (возможно, тайм-аут ожидания контента): {e}")
             return ""
 
     def is_marketplace_related(self, text: str) -> bool:
@@ -212,19 +230,27 @@ class NewsScraper:
             return []
     
     def scrape_telegram_channel(self, channel_url: str) -> List[Dict]:
-        """Парсинг Telegram канала (базовая реализация)"""
-        # Для полноценного парсинга Telegram нужен Telegram API
-        # Здесь базовая реализация для демонстрации
-        try:
-            # В реальном проекте здесь будет интеграция с Telegram API
-            # или использование веб-версии Telegram
-            logger.info(f"Парсинг Telegram канала: {channel_url}")
+        """Парсинг Telegram-канала с использованием Telethon клиента."""
+        if not self.telegram_client:
+            logger.warning(f"Парсинг Telegram-каналов отключен, так как не заданы TELEGRAM_API_ID и TELEGRAM_API_HASH. Пропуск источника: {channel_url}")
             return []
             
+        logger.info(f"Парсинг Telegram-канала: {channel_url}")
+        try:
+            # Запускаем асинхронную функцию в синхронном контексте
+            messages = asyncio.run(self.telegram_client.get_channel_messages(channel_url))
+            
+            # Фильтруем по ключевым словам
+            relevant_articles = [
+                msg for msg in messages 
+                if self.is_marketplace_related(msg['content'])
+            ]
+            return relevant_articles
+            
         except Exception as e:
-            logger.error(f"Ошибка при парсинге Telegram канала {channel_url}: {e}")
+            logger.error(f"Ошибка при парсинге Telegram-канала {channel_url}: {e}")
             return []
-    
+            
     def scrape_source(self, source_type: str, url: str) -> List[Dict]:
         """Парсинг источника в зависимости от его типа"""
         if source_type == 'rss':

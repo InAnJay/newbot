@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 class MistralClient:
     def __init__(self):
+        # API ключ теперь обычно подхватывается автоматически из переменных окружения
+        # библиотекой mistralai. Оставляем проверку для надежности.
         if not MISTRAL_API_KEY:
             raise ValueError("MISTRAL_API_KEY не установлен в переменных окружения")
 

@@ -10,13 +10,18 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
-from telegram_bot import NewsBot
-from scheduler import NewsScheduler
+from config import (
+    TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, TARGET_CHANNEL_ID,
+    MISTRAL_API_KEY, OPENAI_API_KEY,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH
+)
 from database import Database
-from config import TELEGRAM_BOT_TOKEN, MISTRAL_API_KEY, OPENAI_API_KEY, ADMIN_USER_ID, TARGET_CHANNEL_ID
+from news_scraper import NewsScraper
 from mistral_client import MistralClient
 from openai_client import OpenAIClient
-from news_scraper import NewsScraper
+from telegram_client import TelegramScraperClient
+from scheduler import NewsScheduler
+from telegram_bot import NewsBot
 
 # --- Настройка логирования ---
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -66,20 +71,27 @@ def main():
         check_env_vars()
         logger.info("Проверка переменных окружения пройдена.")
 
-        # Инициализация компонентов
+        # --- 3. Инициализация компонентов ---
+        logger.info("Инициализация компонентов...")
         db = Database()
-        mistral = MistralClient()
-        openai = OpenAIClient()
-        scraper = NewsScraper(mistral, db) # Передаем mistral и db в scraper
+        mistral_client = MistralClient()
+        openai_client = OpenAIClient()
         
-        scheduler = NewsScheduler(db, scraper, mistral, openai)
-        bot = NewsBot(db, scheduler, mistral, openai)
-
-        # Запуск планировщика в отдельном потоке
+        telegram_scraper_client = None
+        if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+            logger.info("Найдены ключи Telegram API. Активирую парсинг Telegram-каналов.")
+            telegram_scraper_client = TelegramScraperClient()
+        else:
+            logger.warning("TELEGRAM_API_ID и TELEGRAM_API_HASH не найдены в .env. Парсинг Telegram-каналов отключен.")
+        
+        news_scraper = NewsScraper(mistral_client, db, telegram_scraper_client)
+        
+        scheduler = NewsScheduler(db, news_scraper, mistral_client, openai_client)
         scheduler.start_scheduler()
 
         # Запуск бота
         logger.info("Запускаю Telegram-бота...")
+        bot = NewsBot(db, scheduler, mistral_client, openai_client)
         bot.run()
 
     except ValueError as ve:

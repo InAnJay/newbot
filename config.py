@@ -3,17 +3,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Telegram настройки
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
-TARGET_CHANNEL_ID = os.getenv('TARGET_CHANNEL_ID')
+# --- Telegram Bot ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID")) if os.getenv("ADMIN_USER_ID") else None
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID")
 
+# --- Telegram User API (для парсинга каналов) ---
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
-# Mistral AI настройки
-MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY')
-
-# OpenAI настройки (только для изображений)
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+# --- AI APIs ---
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # База данных
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///news_bot.db')

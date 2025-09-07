@@ -40,6 +40,9 @@ def admin_only(func):
 SOURCE_URL, SOURCE_NAME, SOURCE_TYPE = range(3)
 # Определяем состояния для диалога управления ключевыми словами
 KEYWORD_MANAGE, KEYWORD_ADD, KEYWORD_DELETE = range(3, 6)
+# Определяем состояния для диалога редактирования источника
+EDIT_SOURCE_NAME, EDIT_SOURCE_URL = range(6, 8)
+
 
 class NewsBot:
     def __init__(self, db: Database, scheduler: NewsScheduler, mistral: MistralClient, openai: OpenAIClient):
@@ -68,8 +71,6 @@ class NewsBot:
         
         if data == "view_news":
             await self.show_pending_news(query, context)
-        elif data == "delete_duplicates":
-            await self.delete_duplicates(query, context)
         elif data == "manage_sources":
             await self.manage_sources(query)
         elif data == "check_sources":
@@ -90,13 +91,123 @@ class NewsBot:
             await self.reject_article(query, data, context)
         elif data == "main_menu":
             await self.show_main_menu(query, context)
+        elif data.startswith('view_news_page_'):
+            try:
+                page = int(data.replace('view_news_page_', ''))
+                # Добавим защиту, чтобы страница не могла быть меньше 1
+                if page < 1:
+                    page = 1
+                await self.show_pending_news(query, context, page=page)
+            except (ValueError, TypeError):
+                await query.answer("❌ Ошибка: неверный номер страницы.")
+        elif data.startswith('delete_article_'):
+            await self.delete_article_callback(query, context, data)
+        elif data == "clear_database":
+            await self.show_clear_database_confirmation(query, context)
+        elif data == "confirm_clear_database":
+            await self.clear_database(query, context)
+        elif data == "cancel_clear_database":
+            await self.show_main_menu(query, context)
         elif data == "add_source":
             await self.show_add_source_form(update, context)
+        elif data.startswith("view_source_"):
+            await self.view_source_details(query, data)
         elif data.startswith("delete_source_"):
             await self.delete_source(query, data)
-        elif data == "noop":
-            await query.answer() # Просто подтверждаем нажатие, ничего не делаем
-    
+        elif data.startswith('edit_source_'):
+            await self.start_edit_source(query, context)
+        else:
+            await query.answer("Неизвестная команда.")
+
+    async def delete_article_callback(self, query: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+        """Обрабатывает нажатие кнопки удаления статьи."""
+        try:
+            article_id = int(data.replace('delete_article_', ''))
+            
+            # Удаляем статью из БД
+            success = self.db.delete_article(article_id)
+
+            if success:
+                await query.answer("✅ Новость удалена")
+                # Обновляем список новостей, чтобы удаленная новость исчезла
+                # Получаем текущую страницу из callback_data кнопки "Назад" в сообщении
+                current_page = 1
+                if query.message and query.message.reply_markup:
+                    for row in query.message.reply_markup.inline_keyboard:
+                        for button in row:
+                            if button.callback_data.startswith('view_news_page_'):
+                                try:
+                                    current_page = int(button.callback_data.replace('view_news_page_', ''))
+                                    break
+                                except ValueError:
+                                    pass
+                        if current_page != 1:
+                            break
+                
+                await self.show_pending_news(query, context, page=current_page)
+            else:
+                await query.answer("❌ Ошибка при удалении новости")
+        except (IndexError, ValueError):
+            await query.answer("❌ Ошибка: неверный ID статьи для удаления.")
+        except Exception as e:
+            logger.error(f"Ошибка в delete_article_callback: {e}")
+            await query.answer("❌ Произошла внутренняя ошибка.")
+
+    async def show_clear_database_confirmation(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает подтверждение для очистки базы данных."""
+        text = (
+            "⚠️ **ВНИМАНИЕ!**\n\n"
+            "Вы собираетесь удалить ВСЕ статьи из базы данных.\n"
+            "Это действие нельзя отменить!\n\n"
+            "Продолжить?"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Да, удалить всё", callback_data="confirm_clear_database"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear_database")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                await query.answer()
+            else:
+                logger.error(f"Ошибка при редактировании сообщения: {e}")
+
+    async def clear_database(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Выполняет полную очистку базы данных."""
+        try:
+            await query.answer("⏳ Очищаю базу данных...")
+            
+            # Выполняем очистку в отдельном потоке, чтобы не блокировать бота
+            loop = asyncio.get_event_loop()
+            deleted_count = await loop.run_in_executor(None, self.db.clear_all_articles)
+            
+            text = f"✅ **База данных очищена!**\n\nУдалено статей: **{deleted_count}**"
+            keyboard = [[InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при очистке базы данных: {e}")
+            await query.edit_message_text(
+                text=f"❌ Произошла ошибка при очистке базы данных: {e}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu")]])
+            )
+            
     async def show_main_menu(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Показать главное меню (надежная версия)"""
         text = "🤖 Главное меню бота для управления новостями о маркетплейсах\n\nВыберите действие:"
@@ -123,65 +234,69 @@ class NewsBot:
                 # Пробрасываем другие, неизвестные ошибки
                 raise
 
-    async def delete_duplicates(self, query, context: ContextTypes.DEFAULT_TYPE):
-        """Удаляет дубликаты статей и обновляет список."""
-        await query.answer("⏳ Ищу и удаляю дубликаты...")
+    async def show_pending_news(self, query, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+        """Показывает список новостей на модерации с пагинацией."""
         
-        deleted_count = self.db.delete_duplicate_articles()
+        # Данные теперь очищаются один раз при старте, убираем постоянную очистку.
+        # Это предотвратит "прыжки" в количестве страниц.
+
+        # 1. Получаем актуальные данные
+        page_size = 15
+        articles, total_articles = self.db.get_pending_articles_paginated(page=page, page_size=page_size)
         
-        # Используем edit_message_text, чтобы не отправлять новое всплывающее уведомление, 
-        # а сразу показать результат в основном сообщении.
-        
-        # Сначала покажем короткое уведомление
-        if deleted_count > 0:
-            await context.bot.send_message(query.message.chat_id, f"✅ Удалено {deleted_count} дубликатов.")
+        total_pages = (total_articles + page_size - 1) // page_size
+        if total_pages == 0: total_pages = 1
+
+        # 2. Проверяем, не "исчезла" ли наша страница (например, из-за удаления статей вручную)
+        if page > total_pages:
+            await query.answer(f"Список новостей обновился. Перенаправляю на последнюю страницу ({total_pages}).", show_alert=True)
+            # Рекурсивно вызываем себя с правильной, последней страницей
+            await self.show_pending_news(query, context, page=total_pages)
+            return
+
+        # 3. Формируем и отображаем сообщение
+        if not articles and page == 1:
+            text = "✅ Все новости обработаны! Новых статей для модерации нет."
+            keyboard = [[InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu")]]
         else:
-            await context.bot.send_message(query.message.chat_id, "👍 Дубликаты не найдены.")
+            text = f"📰 Новости на модерации ({total_articles} шт.)\n\nСтраница {page}/{total_pages}"
             
-        # Обновляем текущее сообщение со списком новостей
-        await self.show_pending_news(query, context)
-
-    async def show_pending_news(self, query, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список новостей на модерации (надежная версия)."""
-        articles = self.db.get_pending_articles()
-        
-        keyboard = []
-        if not articles:
-            message_text = "✅ Все новости обработаны! Новых статей для модерации нет."
-        else:
-            message_text = "📰 **Новости на модерацию:**\n\nВыберите новость для просмотра."
+            keyboard = []
             for article in articles:
-                title = (article['original_title'] or 'Без заголовка')[:50]
-                keyboard.append(
-                    [InlineKeyboardButton(title, callback_data=f"article_{article['id']}")]
-                )
-        
-        if articles:
-            keyboard.append([InlineKeyboardButton("🗑️ Удалить дубли", callback_data="delete_duplicates")])
+                # Используем 'original_title', так как это ключ из БД для списка
+                title_text = article.get('original_title') or 'Без заголовка'
+                # Ограничиваем заголовок до 50 символов, чтобы оставить место для кнопки удаления
+                short_title = title_text if len(title_text) < 50 else title_text[:47] + "..."
+                
+                # Создаем строку только с заголовком (занимает всю ширину)
+                keyboard.append([InlineKeyboardButton(short_title, callback_data=f"view_article_{article['id']}")])
 
-        keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data="main_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+            pagination_row = []
+            if page > 1:
+                pagination_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"view_news_page_{page - 1}"))
+            if page < total_pages:
+                pagination_row.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"view_news_page_{page + 1}"))
+            
+            if pagination_row:
+                keyboard.append(pagination_row)
+            
+            keyboard.append([InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu")])
+
         try:
-            await query.edit_message_text(
-                message_text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML
             )
         except BadRequest as e:
             if "Message is not modified" in str(e):
-                pass
-            elif "There is no text in the message to edit" in str(e):
-                # Не можем отредактировать сообщение с фото, поэтому удаляем его и отправляем новое
-                await query.delete_message()
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=message_text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                await query.answer()
             else:
-                raise
+                logger.error(f"Не удалось отредактировать сообщение в show_pending_news: {e}")
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка в show_pending_news: {e}")
 
     async def send_article_for_review(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, article_id: int):
         """Отправляет новое сообщение со статьей на проверку."""
@@ -229,7 +344,10 @@ class NewsBot:
                 InlineKeyboardButton("✅ Опубликовать", callback_data=f"publish_{article_id}"),
                 InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{article_id}")
             ],
-            [InlineKeyboardButton("🔙 Назад к списку", callback_data="view_news")]
+            [
+                InlineKeyboardButton("🗑️ Удалить статью", callback_data=f"delete_article_{article_id}")
+            ],
+            [InlineKeyboardButton("🔙 Назад к списку", callback_data="view_news_page_1")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -443,14 +561,11 @@ class NewsBot:
         keyboard = []
         for source in sources:
             status = "✅" if source.get('is_active', 1) else "❌"
+            # Теперь вся строка - это кнопка для просмотра деталей
             keyboard.append([
                 InlineKeyboardButton(
                     f"{status} {source['name']}", 
-                    callback_data=f"noop" # Placeholder, toggle not implemented
-                ),
-                InlineKeyboardButton(
-                    "❌ Удалить", 
-                    callback_data=f"delete_source_{source['id']}"
+                    callback_data=f"view_source_{source['id']}"
                 )
             ])
         
@@ -459,11 +574,9 @@ class NewsBot:
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        message = "⚙️ **Управление источниками новостей**\n\n"
+        message = "⚙️ **Управление источниками новостей**\n\nНажмите на источник, чтобы просмотреть детали и изменить его."
         if not sources:
-            message += "Пока нет добавленных источников."
-        else:
-            message += "Вы можете добавить новый источник или удалить существующий."
+            message = "Пока нет добавленных источников. Нажмите 'Добавить', чтобы начать."
         
         try:
             await query.edit_message_text(
@@ -478,9 +591,54 @@ class NewsBot:
             else:
                 raise
 
+    async def view_source_details(self, query, data):
+        """Показать детальную информацию об источнике и кнопки для редактирования."""
+        try:
+            source_id = int(data.replace('view_source_', ''))
+        except (ValueError, IndexError):
+            await query.answer("❌ Неверный ID источника.", show_alert=True)
+            return
+
+        source = self.db.get_source_by_id(source_id)
+
+        if not source:
+            await query.answer("❌ Источник не найден.", show_alert=True)
+            return
+
+        text = (
+            f"**Источник:** `{source['name']}`\n"
+            f"**Тип:** `{source['source_type']}`\n"
+            f"**URL:** `{source['url']}`"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✏️ Изменить название", callback_data=f"edit_name_{source_id}"),
+                InlineKeyboardButton("✏️ Изменить URL", callback_data=f"edit_url_{source_id}")
+            ],
+            [
+                 InlineKeyboardButton("❌ Удалить источник", callback_data=f"delete_source_{source_id}")
+            ],
+            [
+                InlineKeyboardButton("🔙 Назад к источникам", callback_data="manage_sources")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+
     async def delete_source(self, query, data):
         """Удалить источник новостей"""
-        source_id = int(data.split("_")[2])
+        try:
+            source_id = int(data.replace('delete_source_', ''))
+        except (ValueError, IndexError):
+            await query.answer("❌ Неверный формат ID источника.", show_alert=True)
+            return
         
         source = self.db.get_source_by_id(source_id)
         if not source:
@@ -498,17 +656,34 @@ class NewsBot:
         await self.manage_sources(query)
 
     def normalize_url(self, url: str) -> str:
-        """Нормализует URL, убирая параметры, фрагменты и конечный слэш."""
+        """
+        Агрессивно нормализует URL для максимальной унификации:
+        - Убирает схему (http/https)
+        - Убирает 'www.'
+        - Убирает параметры и фрагменты
+        - Убирает конечный слэш
+        """
         if not url:
             return ""
         try:
-            parsed = urlparse(url)
+            # Сначала убираем схему для лучшей унификации
+            if url.startswith(('http://', 'https://')):
+                url = url.split('://', 1)[1]
+            
+            # Убираем www.
+            if url.startswith('www.'):
+                url = url.split('www.', 1)[1]
+
+            # Используем urlparse для остального
+            parsed = urlparse('http://' + url) # Добавляем временную схему для парсинга
             path = parsed.path.rstrip('/')
-            normalized = urlunparse((parsed.scheme, parsed.netloc, path, '', '', ''))
+            
+            # Собираем без схемы
+            normalized = f"{parsed.netloc}{path}".lower()
             return normalized
         except Exception as e:
             logger.warning(f"Не удалось нормализовать URL '{url}': {e}")
-            return url
+            return url.lower()
 
     async def check_sources(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Запускает принудительную проверку источников и сообщает результат."""
@@ -527,16 +702,23 @@ class NewsBot:
 
         # Запускаем тяжелую задачу в отдельном потоке
         loop = asyncio.get_event_loop()
-        new_articles_count = await loop.run_in_executor(
+        results = await loop.run_in_executor(
             None, self.scheduler.force_check_sources
         )
 
         # Сообщаем результат и снова показываем меню
-        text = (
-            f"✅ Проверка завершена!\n\n"
-            f"Найдено новых статей: **{new_articles_count}**.\n\n"
-            "Новые статьи (если они есть) теперь доступны для модерации в разделе 'Просмотреть новости'."
-        )
+        total = results.get('total', 0)
+        by_source = results.get('by_source', {})
+
+        text = f"✅ **Проверка завершена!**\n\nНайдено новых статей: **{total}**\n\n"
+
+        if total > 0:
+            text += "В том числе:\n"
+            for source_name, count in by_source.items():
+                if count > 0:
+                    text += f"- `{source_name}`: **{count}**\n"
+        
+        text += "\nНовые статьи (если они есть) теперь доступны для модерации."
         
         await query.edit_message_text(
             text=text,
@@ -572,7 +754,8 @@ class NewsBot:
             [InlineKeyboardButton("⚙️ Управление источниками", callback_data="manage_sources")],
             [InlineKeyboardButton("🔑 Управление словами", callback_data="manage_keywords")],
             [InlineKeyboardButton("🔄 Проверить источники", callback_data="check_sources")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="statistics")]
+            [InlineKeyboardButton("📊 Статистика", callback_data="statistics")],
+            [InlineKeyboardButton("🗑️ Очистить базу данных", callback_data="clear_database")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
@@ -628,14 +811,24 @@ class NewsBot:
         source_type = query.data
         name = context.user_data.get('source_name')
         url = context.user_data.get('source_url')
+
+        if not name or not url:
+            await query.edit_message_text(
+                "❌ Произошла ошибка: не удалось найти данные об источнике. Попробуйте снова.",
+                reply_markup=self.get_back_to_menu_keyboard()
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        normalized_url = self.normalize_url(url)
         
         try:
-            source_id = self.db.add_news_source(name, url, source_type)
+            source_id = self.db.add_news_source(name, normalized_url, source_type)
             message = (
                 f"✅ Источник успешно добавлен!\n\n"
                 f"**Название:** {name}\n"
                 f"**Тип:** {source_type}\n"
-                f"**URL:** {url}"
+                f"**URL:** {normalized_url}"
             )
             await query.edit_message_text(
                 message,
@@ -643,9 +836,15 @@ class NewsBot:
                 disable_web_page_preview=True,
                 reply_markup=self.get_back_to_menu_keyboard()
             )
-        except Exception as e:
+        except ValueError as e: # Ловим конкретную ошибку от слоя базы данных
             await query.edit_message_text(
-                f"❌ Произошла ошибка при добавлении источника: {e}",
+                f"❌ Ошибка: {e}",
+                reply_markup=self.get_back_to_menu_keyboard()
+            )
+        except Exception as e: # Общая ошибка на всякий случай
+            logger.error(f"Неожиданная ошибка при добавлении источника {name} ({normalized_url}): {e}")
+            await query.edit_message_text(
+                f"❌ Произошла непредвиденная ошибка при добавлении источника.",
                 reply_markup=self.get_back_to_menu_keyboard()
             )
         
@@ -658,6 +857,70 @@ class NewsBot:
             "Действие отменено. Вы вернулись в главное меню.",
             reply_markup=self.get_main_menu_keyboard()
         )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # --- Конец блока ConversationHandler ---
+
+    # --- Начало блока ConversationHandler для редактирования источника ---
+
+    async def start_edit_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Начало диалога редактирования. Запрашивает новое значение."""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            action, source_id_str = query.data.rsplit("_", 1)
+            source_id = int(source_id_str)
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Ошибка: не удалось распознать команду. Попробуйте снова.")
+            return ConversationHandler.END
+
+        context.user_data['edit_source_id'] = source_id
+
+        if action == 'edit_name':
+            context.user_data['edit_field'] = 'name'
+            await query.edit_message_text("Пожалуйста, введите новое название для источника.\n\nДля отмены введите /cancel")
+            return EDIT_SOURCE_NAME
+        elif action == 'edit_url':
+            context.user_data['edit_field'] = 'url'
+            await query.edit_message_text("Пожалуйста, введите новый URL для источника.\n\nДля отмены введите /cancel")
+            return EDIT_SOURCE_URL
+
+    async def receive_new_source_value(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Получает новое значение, обновляет в БД и завершает диалог."""
+        new_value = update.message.text.strip()
+        source_id = context.user_data['edit_source_id']
+        field_to_edit = context.user_data['edit_field']
+        
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К списку источников", callback_data="manage_sources")]])
+
+        try:
+            if field_to_edit == 'name':
+                self.db.update_source_details(source_id, name=new_value)
+            elif field_to_edit == 'url':
+                if not new_value.startswith('http'):
+                    await update.message.reply_text("Это не похоже на ссылку. URL должен начинаться с http или https. Попробуйте снова.")
+                    return EDIT_SOURCE_URL
+                normalized_url = self.normalize_url(new_value)
+                self.db.update_source_details(source_id, url=normalized_url)
+            
+            await update.message.reply_text("✅ Данные источника успешно обновлены!", reply_markup=keyboard)
+
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}\n\nПопробуйте ввести другое значение.")
+            return EDIT_SOURCE_URL if field_to_edit == 'url' else EDIT_SOURCE_NAME
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении источника {source_id}: {e}")
+            await update.message.reply_text("❌ Произошла непредвиденная ошибка.", reply_markup=keyboard)
+
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    async def cancel_edit_source(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Отмена процесса редактирования."""
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 К списку источников", callback_data="manage_sources")]])
+        await update.message.reply_text("Редактирование отменено.", reply_markup=keyboard)
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -782,6 +1045,19 @@ class NewsBot:
             fallbacks=[CommandHandler('cancel', self.cancel_add_source)],
         )
 
+        # Создаем ConversationHandler для редактирования источника
+        edit_source_conv_handler = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(self.start_edit_source, pattern='^edit_name_'),
+                CallbackQueryHandler(self.start_edit_source, pattern='^edit_url_')
+            ],
+            states={
+                EDIT_SOURCE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_new_source_value)],
+                EDIT_SOURCE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_new_source_value)],
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel_edit_source)],
+        )
+
         # Создаем ConversationHandler для управления ключевыми словами
         manage_keywords_conv_handler = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.manage_keywords_menu, pattern='^manage_keywords$')],
@@ -803,6 +1079,7 @@ class NewsBot:
         
         # Добавляем обработчики. ConversationHandler должен быть первым.
         application.add_handler(add_source_conv_handler)
+        application.add_handler(edit_source_conv_handler)
         application.add_handler(manage_keywords_conv_handler)
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CallbackQueryHandler(self.button_callback))

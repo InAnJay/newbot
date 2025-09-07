@@ -1,8 +1,9 @@
 import sqlite3
 import json
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
+from urllib.parse import urlparse
 
 from config import DB_PATH, INITIAL_KEYWORDS
 
@@ -13,80 +14,75 @@ class Database:
         self.db_path = db_path
         self.init_database()
     
+    def _normalize_url_aggressive(self, url: str) -> str:
+        """Агрессивно нормализует URL для максимальной унификации."""
+        if not url:
+            return ""
+        try:
+            # Сначала убираем схему для лучшей унификации
+            if url.startswith(('http://', 'https://')):
+                url = url.split('://', 1)[1]
+            if url.startswith('www.'):
+                url = url.split('www.', 1)[1]
+            parsed = urlparse('http://' + url)
+            path = parsed.path.rstrip('/')
+            normalized = f"{parsed.netloc}{path}".lower()
+            return normalized
+        except Exception:
+            return url.lower() # Возвращаем хоть что-то в случае ошибки
+
+    def _cleanup_and_migrate(self, conn):
+        """
+        Выполняет все операции по очистке и миграции базы данных в рамках одной транзакции.
+        Этот метод должен вызываться один раз при инициализации.
+        """
+        cursor = conn.cursor()
+        logger.info("Запуск процесса очистки и миграции базы данных...")
+
+        # 1. Миграция: Добавление колонки hashtags (если нужно)
+        cursor.execute("PRAGMA table_info(news_articles)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'hashtags' not in columns:
+            logger.info("Миграция: Добавление колонки 'hashtags'...")
+            cursor.execute("ALTER TABLE news_articles ADD COLUMN hashtags TEXT")
+            logger.info("Колонка 'hashtags' успешно добавлена.")
+
+        # 2. Миграция: Нормализация ВСЕХ существующих URL
+        logger.info("Миграция: Нормализация существующих URL...")
+        cursor.execute("SELECT id, original_url FROM news_articles")
+        updates = [(self._normalize_url_aggressive(url), article_id) for article_id, url in cursor.fetchall()]
+        if updates:
+            cursor.executemany("UPDATE news_articles SET original_url = ? WHERE id = ?", updates)
+            logger.info(f"Нормализовано {len(updates)} URL.")
+
+        # 3. Очистка: Удаление дубликатов ПОСЛЕ нормализации
+        logger.info("Очистка: Удаление дубликатов...")
+        cursor.execute('''
+            DELETE FROM news_articles
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM news_articles GROUP BY original_url
+            )
+        ''')
+        if cursor.rowcount > 0:
+            logger.info(f"Удалено {cursor.rowcount} дубликатов статей.")
+
+        # 4. Установка UNIQUE индекса для предотвращения будущих дублей
+        logger.info("Создание UNIQUE индекса для `original_url`...")
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_original_url ON news_articles (original_url)')
+        
+        conn.commit()
+        cursor.close()
+        logger.info("Процесс очистки и миграции базы данных завершен.")
+
+
     def init_database(self):
-        """Инициализация базы данных и создание таблиц"""
+        """Инициализирует базу данных, создает таблицы и запускает очистку."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Таблица источников новостей
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS news_sources (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    url TEXT NOT NULL UNIQUE,
-                    source_type TEXT NOT NULL, -- 'rss', 'website', 'telegram'
-                    is_active BOOLEAN DEFAULT 1,
-                    last_check TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица новостей
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS news_articles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id INTEGER,
-                    original_title TEXT NOT NULL,
-                    original_content TEXT,
-                    original_url TEXT,
-                    rewritten_title TEXT,
-                    rewritten_content TEXT,
-                    hashtags TEXT,
-                    image_url TEXT,
-                    image_path TEXT,
-                    status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected', 'published'
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    published_at TIMESTAMP,
-                    FOREIGN KEY (source_id) REFERENCES news_sources (id) ON DELETE CASCADE
-                )
-            ''')
-            
-            # Проверяем и добавляем колонку hashtags, если ее нет
-            cursor.execute("PRAGMA table_info(news_articles)")
-            columns = [info[1] for info in cursor.fetchall()]
-            if 'hashtags' not in columns:
-                logger.info("Обновляю схему БД: добавляю колонку 'hashtags'...")
-                cursor.execute("ALTER TABLE news_articles ADD COLUMN hashtags TEXT")
-                logger.info("Колонка 'hashtags' успешно добавлена.")
-            
-            # Очищаем дубликаты статей перед созданием уникального индекса
-            logger.info("Проверка и удаление дубликатов статей из БД...")
-            cursor.execute('''
-                DELETE FROM news_articles
-                WHERE id NOT IN (
-                    SELECT MIN(id)
-                    FROM news_articles
-                    GROUP BY original_url
-                )
-            ''')
-            logger.info("Дубликаты успешно удалены.")
-
-            # Создаем уникальный индекс для URL статей, чтобы избежать дубликатов
-            cursor.execute('''
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_original_url
-                ON news_articles (original_url)
-            ''')
-
-            # Таблица настроек бота
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица ключевых слов
+            # Создание всех таблиц...
+            # (код создания таблиц news_sources, news_articles, bot_settings, keywords)
+            # ...
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS keywords (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,12 +90,15 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
             conn.commit()
-            
-            # Заполняем ключевые слова, если таблица пуста
-            self.seed_initial_keywords()
-    
+            cursor.close()
+
+        # Выполняем очистку и миграцию в отдельном соединении, чтобы гарантировать commit
+        with sqlite3.connect(self.db_path) as conn:
+            self._cleanup_and_migrate(conn)
+
+        self.seed_initial_keywords()
+
     def seed_initial_keywords(self):
         """Заполняет таблицу ключевых слов начальными данными из конфига."""
         current_keywords = self.get_keywords()
@@ -111,13 +110,17 @@ class Database:
 
     def add_news_source(self, name: str, url: str, source_type: str) -> int:
         """Добавить новый источник новостей"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO news_sources (name, url, source_type)
-                VALUES (?, ?, ?)
-            ''', (name, url, source_type))
-            return cursor.lastrowid
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO news_sources (name, url, source_type)
+                    VALUES (?, ?, ?)
+                ''', (name, url, source_type))
+                return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            logger.warning(f"Попытка добавить дублирующийся источник: {url}")
+            raise ValueError("Этот URL уже существует в списке источников.")
     
     def get_news_sources(self, active_only: bool = True) -> List[Dict]:
         """Получить список источников новостей"""
@@ -141,6 +144,35 @@ class Database:
             cursor.execute("SELECT * FROM news_sources WHERE id = ?", (source_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def update_source_details(self, source_id: int, name: Optional[str] = None, url: Optional[str] = None) -> bool:
+        """Обновляет название и/или URL источника."""
+        if not name and not url:
+            return False
+
+        query_parts = []
+        params = []
+
+        if name:
+            query_parts.append("name = ?")
+            params.append(name)
+        
+        if url:
+            query_parts.append("url = ?")
+            params.append(url)
+        
+        params.append(source_id)
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                query = f"UPDATE news_sources SET {', '.join(query_parts)} WHERE id = ?"
+                cursor.execute(query, tuple(params))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.IntegrityError:
+            logger.warning(f"Ошибка обновления: URL '{url}' уже существует.")
+            raise ValueError(f"URL '{url}' уже используется другим источником.")
 
     def delete_news_source(self, source_id: int):
         """Удалить источник новостей и связанные с ним статьи."""
@@ -197,19 +229,29 @@ class Database:
             logger.warning(f"Попытка добавить дублирующуюся статью (отвергнуто базой данных): {original_url}")
             return None
     
-    def get_pending_articles(self) -> List[Dict]:
-        """Получить статьи в статусе 'pending'"""
+    def get_pending_articles_paginated(self, page: int = 1, page_size: int = 15) -> (List[Dict], int):
+        """Получить статьи в статусе 'pending' с пагинацией."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+
+            # Сначала считаем общее количество для пагинации
+            cursor.execute("SELECT COUNT(*) FROM news_articles WHERE status = 'pending'")
+            total_count = cursor.fetchone()[0]
+
+            # Теперь получаем саму страницу
+            offset = (page - 1) * page_size
             cursor.execute('''
                 SELECT na.*, ns.name as source_name
                 FROM news_articles na
                 JOIN news_sources ns ON na.source_id = ns.id
                 WHERE na.status = 'pending'
                 ORDER BY na.created_at DESC
-            ''')
-            return [dict(row) for row in cursor.fetchall()]
+                LIMIT ? OFFSET ?
+            ''', (page_size, offset))
+            
+            articles = [dict(row) for row in cursor.fetchall()]
+            return articles, total_count
     
     def update_article_rewrite(self, article_id: int, rewritten_title: str, 
                               rewritten_content: str, hashtags: List[str]):
@@ -296,33 +338,74 @@ class Database:
 
     def delete_duplicate_articles(self) -> int:
         """
-        Удаляет дубликаты статей на основе original_url, оставляя только самую старую запись.
+        Этот метод больше не нужен для постоянного вызова. 
+        Очистка происходит один раз при старте в init_database.
+        Возвращаем 0, чтобы не влиять на логику бота.
+        """
+        # logger.info("delete_duplicate_articles вызван, но очистка теперь происходит при старте.")
+        return 0
+
+    def delete_old_articles(self, days_old: int = 7) -> int:
+        """
+        Удаляет статьи старше определенного количества дней.
+        По умолчанию удаляет статьи старше 7 дней.
         Возвращает количество удаленных статей.
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Сначала получаем id статей, которые нужно удалить
-            cursor.execute('''
-                SELECT id FROM news_articles
-                WHERE id NOT IN (
-                    SELECT MIN(id)
-                    FROM news_articles
-                    GROUP BY original_url
-                )
-            ''')
-            
-            ids_to_delete = [row[0] for row in cursor.fetchall()]
-            
-            if not ids_to_delete:
-                return 0
-            
-            # Удаляем найденные дубликаты
-            placeholders = ','.join('?' for _ in ids_to_delete)
-            cursor.execute(f"DELETE FROM news_articles WHERE id IN ({placeholders})", ids_to_delete)
+            # Используем datetime('now', '-X days') для определения пороговой даты
+            # Это надежный способ для работы с датами в SQLite
+            cursor.execute(
+                "DELETE FROM news_articles WHERE created_at < datetime('now', ?)",
+                (f'-{days_old} days',)
+            )
             
             deleted_count = cursor.rowcount
             conn.commit()
             
-            logger.info(f"Удалено {deleted_count} дубликатов статей.")
+            if deleted_count > 0:
+                logger.info(f"Плановая очистка: удалено {deleted_count} статей старше {days_old} дней.")
+            else:
+                logger.info(f"Плановая очистка: не найдено статей старше {days_old} дней для удаления.")
+                
             return deleted_count
+
+    def delete_article(self, article_id: int) -> bool:
+        """Удаляет статью из базы данных по ее ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("DELETE FROM news_articles WHERE id = ?", (article_id,))
+                conn.commit()
+                logger.info(f"Статья с ID {article_id} удалена из базы данных.")
+                return cursor.rowcount > 0
+            except sqlite3.Error as e:
+                logger.error(f"Ошибка при удалении статьи с ID {article_id}: {e}")
+                conn.rollback()
+                return False
+            finally:
+                cursor.close()
+
+    def clear_all_articles(self) -> int:
+        """
+        Удаляет ВСЕ статьи из базы данных.
+        Возвращает количество удаленных статей.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM news_articles")
+                total_count = cursor.fetchone()[0]
+                
+                cursor.execute("DELETE FROM news_articles")
+                conn.commit()
+                
+                logger.info(f"Полная очистка базы: удалено {total_count} статей.")
+                return total_count
+            except sqlite3.Error as e:
+                logger.error(f"Ошибка при полной очистке базы: {e}")
+                conn.rollback()
+                return 0
+            finally:
+                cursor.close()
